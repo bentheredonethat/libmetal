@@ -83,6 +83,7 @@ elseif (SOC_FAMILY STREQUAL "versal")
   add_definitions(-DCONFIG_IPI_DEV_NAME="ff360000.ipi")
   add_definitions(-DCONFIG_TTC_DEV_NAME="ff0e0000.ttc0")
   add_definitions(-DCONFIG_IPI_MASK=0x08)
+  add_definitions(-Dversal=1)
 endif (SOC_FAMILY STREQUAL "zynqmp")
 
 # vim: expandtab:ts=2:sw=2:smartindent
