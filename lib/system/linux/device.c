@@ -14,6 +14,8 @@
 #include <metal/utilities.h>
 #include <metal/irq.h>
 
+#include <stdint.h>
+
 #include "irq.h"
 
 #define MAX_DRIVERS	64
@@ -59,10 +61,32 @@ struct linux_device {
 	char				dev_path[PATH_MAX];
 	char				cls_path[PATH_MAX];
 	metal_phys_addr_t		region_phys[METAL_MAX_DEVICE_REGIONS];
+	void				*region_map_raw[METAL_MAX_DEVICE_REGIONS];
+	size_t				region_map_len[METAL_MAX_DEVICE_REGIONS];
 	struct linux_driver		*ldrv;
 	struct sysfs_device		*sdev;
 	struct sysfs_attribute		*override;
 	int				fd;
+};
+
+/**
+ * @internal
+ *
+ * @brief UIO map attributes and derived libmetal region information.
+ *
+ * UIO sysfs reports a full mmap() extent plus a separate offset to the
+ * usable resource. This structure keeps those inputs together while converting
+ * them into the libmetal physical address, mmap length, and exported region
+ * size.
+ */
+struct metal_uio_map_info {
+	const char			*dev_name;
+	metal_phys_addr_t		map_addr;
+	unsigned long			map_size;
+	unsigned long			offset;
+	metal_phys_addr_t		*phys;
+	size_t				*map_len;
+	size_t				*region_size;
 };
 
 static struct linux_bus *to_linux_bus(struct metal_bus *bus)
@@ -97,6 +121,94 @@ static int metal_uio_read_map_attr(struct linux_device *ldev,
 	*value = strtoul(attr->value, NULL, 0);
 
 	sysfs_close_attribute(attr);
+	return 0;
+}
+
+/**
+ * @internal
+ *
+ * @brief Validate the sysfs map offset before applying it to the mmap() base.
+ *
+ * The Linux UIO ABI exposes one mmap slot per page-sized index, so the
+ * per-map offset must remain within a single host page.
+ *
+ * The offset is applied inside one page returned by mmap(). Larger offsets
+ * cannot be represented by adjusting the returned mapping.
+ *
+ * @param[in] dev_name Device name used for error reporting; may be NULL.
+ * @param[in] offset Offset to validate, in bytes.
+ * @return 0 on success, or -EINVAL if the offset exceeds the host page size.
+ */
+static int metal_linux_uio_validate_offset(const char *dev_name,
+					   unsigned long offset)
+{
+	const unsigned long page_size = (unsigned long)getpagesize();
+
+	if (offset >= page_size) {
+		metal_log(METAL_LOG_ERROR,
+			  "device %s has invalid UIO offset 0x%lx (page size 0x%lx)\n",
+			  dev_name ? dev_name : "<unknown>", offset, page_size);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/**
+ * @internal
+ *
+ * @brief Translate UIO sysfs map attributes into libmetal map information.
+ *
+ * This fills in the values required by libmetal: the mmap() length used for
+ * cleanup, the usable physical start address, and the usable I/O region size
+ * after skipping the map offset.
+ *
+ * @param[in,out] info Pointer to the map information structure to populate.
+ * @return 0 on success, or a negative error code on failure.
+ */
+static int metal_linux_uio_map_info(struct metal_uio_map_info *info)
+{
+	int result;
+
+	if (!info || !info->phys || !info->map_len || !info->region_size)
+		return -EINVAL;
+
+	result = metal_linux_uio_validate_offset(info->dev_name, info->offset);
+	if (result)
+		return result;
+
+	if (info->offset >= info->map_size) {
+		metal_log(METAL_LOG_ERROR,
+			  "device %s has invalid UIO size 0x%lx for offset 0x%lx\n",
+			  info->dev_name ? info->dev_name : "<unknown>",
+			  info->map_size, info->offset);
+		return -EINVAL;
+	}
+
+	if (info->map_size > SIZE_MAX) {
+		metal_log(METAL_LOG_ERROR,
+			  "device %s UIO size 0x%lx overflows size_t\n",
+			  info->dev_name ? info->dev_name : "<unknown>",
+			  info->map_size);
+		return -EOVERFLOW;
+	}
+
+	if (info->map_addr + info->offset < info->map_addr) {
+		metal_log(METAL_LOG_ERROR,
+			  "device %s UIO physical address overflow (addr=0x%lx offset=0x%lx)\n",
+			  info->dev_name ? info->dev_name : "<unknown>",
+			  (unsigned long)info->map_addr, info->offset);
+		return -EOVERFLOW;
+	}
+
+	/*
+	 * mmap() uses the full page-aligned map. libmetal clients see only the
+	 * usable resource that starts at offset bytes into that mapping.
+	 */
+	*info->phys = info->map_addr + info->offset;
+	*info->map_len = (size_t)info->map_size;
+	*info->region_size = (size_t)(info->map_size - info->offset);
+
 	return 0;
 }
 
@@ -155,11 +267,15 @@ static int metal_uio_dev_open(struct linux_bus *lbus, struct linux_device *ldev)
 {
 	char *instance, path[SYSFS_PATH_MAX];
 	struct linux_driver *ldrv = ldev->ldrv;
-	unsigned long *phys, offset = 0, size = 0;
+	unsigned long offset = 0, size = 0;
+	metal_phys_addr_t addr = 0, *phys;
 	struct metal_io_region *io;
+	struct metal_uio_map_info map_info;
+	size_t map_len, region_size;
 	struct dlist *dlist;
 	int result, i;
-	void *virt;
+	unsigned int j;
+	void *raw, *virt;
 	int irq_info;
 
 
@@ -177,35 +293,48 @@ static int metal_uio_dev_open(struct linux_bus *lbus, struct linux_device *ldev)
 
 	result = metal_uio_dev_bind(ldev, ldrv);
 	if (result)
-		return result;
+		goto fail;
 
 	result = snprintf(path, sizeof(path), "%s/uio", ldev->sdev->path);
-	if (result >= (int)sizeof(path))
-		return -EOVERFLOW;
+	if (result < 0 || result >= (int)sizeof(path)) {
+		result = -EOVERFLOW;
+		goto fail;
+	}
 	dlist = sysfs_open_directory_list(path);
 	if (!dlist) {
 		metal_log(METAL_LOG_ERROR, "failed to scan class path %s\n",
 			  path);
-		return -errno;
+		result = -errno;
+		goto fail;
 	}
 
 	dlist_for_each_data(dlist, instance, char) {
 		result = snprintf(ldev->cls_path, sizeof(ldev->cls_path),
 				  "%s/%s", path, instance);
-		if (result >= (int)sizeof(ldev->cls_path))
-			return -EOVERFLOW;
+		if (result < 0 || result >= (int)sizeof(ldev->cls_path)) {
+			result = -EOVERFLOW;
+			goto close_list;
+		}
 		result = snprintf(ldev->dev_path, sizeof(ldev->dev_path),
 				  "/dev/%s", instance);
-		if (result >= (int)sizeof(ldev->dev_path))
-			return -EOVERFLOW;
+		if (result < 0 || result >= (int)sizeof(ldev->dev_path)) {
+			result = -EOVERFLOW;
+			goto close_list;
+		}
 		break;
 	}
+	result = 0;
+
+close_list:
 	sysfs_close_list(dlist);
+	if (result)
+		goto fail;
 
 	if (sysfs_path_is_dir(ldev->cls_path) != 0) {
 		metal_log(METAL_LOG_ERROR, "invalid device class path %s\n",
 			  ldev->cls_path);
-		return -ENODEV;
+		result = -ENODEV;
+		goto fail;
 	}
 
 	i = 0;
@@ -218,34 +347,72 @@ static int metal_uio_dev_open(struct linux_bus *lbus, struct linux_device *ldev)
 	if (i >= 1000) {
 		metal_log(METAL_LOG_ERROR, "failed to open file %s, timeout.\n",
 			  ldev->dev_path);
-		return -ENODEV;
+		result = -ENODEV;
+		goto fail;
 	}
 	result = metal_open(ldev->dev_path, 0);
 	if (result < 0) {
 		metal_log(METAL_LOG_ERROR, "failed to open device %s\n",
 			  ldev->dev_path, strerror(-result));
-		return result;
+		goto fail;
 	}
 	ldev->fd = result;
 
 	metal_log(METAL_LOG_DEBUG, "opened %s:%s as %s\n",
 		  lbus->bus_name, ldev->dev_name, ldev->dev_path);
 
-	for (i = 0, result = 0; !result && i < METAL_MAX_DEVICE_REGIONS; i++) {
+	for (i = 0; i < METAL_MAX_DEVICE_REGIONS; i++) {
 		phys = &ldev->region_phys[ldev->device.num_regions];
+		result = metal_uio_read_map_attr(ldev, i, "offset", &offset);
+		/*
+		 * A missing offset for the next map marks the end of the UIO
+		 * map list. Other read errors are real open failures.
+		 */
+		if (result == -ENOENT)
+			break;
+		if (result)
+			goto fail;
 		result = (result ? result :
-			 metal_uio_read_map_attr(ldev, i, "offset", &offset));
-		result = (result ? result :
-			 metal_uio_read_map_attr(ldev, i, "addr", phys));
+			 metal_uio_read_map_attr(ldev, i, "addr", &addr));
 		result = (result ? result :
 			 metal_uio_read_map_attr(ldev, i, "size", &size));
-		result = (result ? result :
-			 metal_map(ldev->fd, i * getpagesize(), size, 0, 0, &virt));
-		if (!result) {
-			io = &ldev->device.regions[ldev->device.num_regions];
-			metal_io_init(io, virt, phys, size, -1, 0, NULL);
-			ldev->device.num_regions++;
+		if (result)
+			goto fail;
+		/*
+		 * UIO sysfs reports addr/size/offset separately. Convert them
+		 * before mmap() so the raw mapping and exposed region stay in
+		 * sync for both normal access and close-time unmap.
+		 */
+		map_info.dev_name = ldev->dev_name;
+		map_info.map_addr = addr;
+		map_info.map_size = size;
+		map_info.offset = offset;
+		map_info.phys = phys;
+		map_info.map_len = &map_len;
+		map_info.region_size = &region_size;
+		result = metal_linux_uio_map_info(&map_info);
+		if (result)
+			goto fail;
+		result = metal_map(ldev->fd, i * getpagesize(), map_len, 0, 0,
+				   &raw);
+		if (result) {
+			metal_log(METAL_LOG_ERROR,
+				  "failed to mmap device %s map%u (len=0x%zx offset=0x%lx): %s\n",
+				  ldev->dev_name, i, map_len,
+				  (unsigned long)i * (unsigned long)getpagesize(),
+				  strerror(-result));
+			goto fail;
 		}
+		virt = (void *)((char *)raw + offset);
+		/*
+		 * Keep the raw mapping for munmap(); expose the adjusted
+		 * address as the usable libmetal I/O region.
+		 */
+		io = &ldev->device.regions[ldev->device.num_regions];
+		metal_io_init(io, virt, phys, region_size, -1, 0, NULL);
+		ldev->region_map_raw[ldev->device.num_regions] = raw;
+		ldev->region_map_len[ldev->device.num_regions] = map_len;
+		ldev->device.num_regions++;
 	}
 
 	irq_info = 1;
@@ -262,6 +429,31 @@ static int metal_uio_dev_open(struct linux_bus *lbus, struct linux_device *ldev)
 	}
 
 	return 0;
+
+fail:
+	for (j = 0; j < ldev->device.num_regions; j++) {
+		metal_unmap(ldev->region_map_raw[j],
+			    ldev->region_map_len[j]);
+		ldev->region_map_raw[j] = NULL;
+		ldev->region_map_len[j] = 0;
+	}
+	ldev->device.num_regions = 0;
+	ldev->device.irq_num = 0;
+	ldev->device.irq_info = (void *)-1;
+	if (ldev->override) {
+		sysfs_write_attribute(ldev->override, "", 1);
+		ldev->override = NULL;
+	}
+	if (ldev->sdev) {
+		sysfs_close_device(ldev->sdev);
+		ldev->sdev = NULL;
+	}
+	if (ldev->fd >= 0) {
+		close(ldev->fd);
+		ldev->fd = -1;
+	}
+
+	return result;
 }
 
 static void metal_uio_dev_close(struct linux_bus *lbus,
@@ -271,8 +463,10 @@ static void metal_uio_dev_close(struct linux_bus *lbus,
 	unsigned int i;
 
 	for (i = 0; i < ldev->device.num_regions; i++) {
-		metal_unmap(ldev->device.regions[i].virt,
-			    ldev->device.regions[i].size);
+		metal_unmap(ldev->region_map_raw[i],
+			    ldev->region_map_len[i]);
+		ldev->region_map_raw[i] = NULL;
+		ldev->region_map_len[i] = 0;
 	}
 	if (ldev->override) {
 		sysfs_write_attribute(ldev->override, "", 1);
