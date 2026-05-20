@@ -462,12 +462,21 @@ static void metal_uio_dev_close(struct linux_bus *lbus,
 	(void)lbus;
 	unsigned int i;
 
+	if (ldev->fd >= 0) {
+		/*
+		 * Disable first so unregister only removes device bookkeeping;
+		 * IRQ handler teardown remains in the generic IRQ path.
+		 */
+		metal_irq_disable(ldev->fd);
+		metal_linux_irq_unregister_dev(ldev->fd);
+	}
 	for (i = 0; i < ldev->device.num_regions; i++) {
 		metal_unmap(ldev->region_map_raw[i],
 			    ldev->region_map_len[i]);
 		ldev->region_map_raw[i] = NULL;
 		ldev->region_map_len[i] = 0;
 	}
+	ldev->device.num_regions = 0;
 	if (ldev->override) {
 		sysfs_write_attribute(ldev->override, "", 1);
 		ldev->override = NULL;
@@ -478,6 +487,7 @@ static void metal_uio_dev_close(struct linux_bus *lbus,
 	}
 	if (ldev->fd >= 0) {
 		close(ldev->fd);
+		ldev->fd = -1;
 	}
 }
 
