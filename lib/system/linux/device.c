@@ -428,7 +428,8 @@ static int metal_linux_dev_open(struct metal_bus *bus,
 	struct linux_bus *lbus = to_linux_bus(bus);
 	struct linux_device *ldev = NULL;
 	struct linux_driver *ldrv;
-	int error;
+	int error = -ENODEV;
+	int ret;
 
 	ldev = malloc(sizeof(*ldev));
 	if (!ldev)
@@ -448,9 +449,18 @@ static int metal_linux_dev_open(struct metal_bus *bus,
 		ldev->device.bus = bus;
 
 		/* Try and open the device. */
-		error = ldrv->dev_open(lbus, ldev);
-		if (error) {
-			ldrv->dev_close(lbus, ldev);
+		ret = ldrv->dev_open(lbus, ldev);
+		if (ret) {
+			/*
+			 * Preserve the first useful errno while still allowing
+			 * clean backend misses to try the same device.
+			 */
+			if (ldrv->dev_close)
+				ldrv->dev_close(lbus, ldev);
+			if (error == -ENODEV)
+				error = ret;
+			if (ret != -ENODEV)
+				goto out;
 			continue;
 		}
 
@@ -461,9 +471,10 @@ static int metal_linux_dev_open(struct metal_bus *bus,
 		return 0;
 	}
 
+out:
 	free(ldev);
 
-	return -ENODEV;
+	return error;
 }
 
 static void metal_linux_dev_close(struct metal_bus *bus,
@@ -668,4 +679,3 @@ int metal_linux_get_device_property(struct metal_device *device,
 	status = close(fd);
 	return status < 0 ? -errno : 0;
 }
-
