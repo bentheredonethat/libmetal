@@ -111,6 +111,22 @@ static struct linux_device *to_linux_device(struct metal_device *device)
 /**
  * @internal
  *
+ * @brief Check whether a Linux bus is the synthetic UIO bus.
+ *
+ * The synthetic UIO bus opens devices directly from /sys/class/uio instead of
+ * through a sysfs bus directory and parent-bus drivers.
+ *
+ * @param[in] lbus Linux bus to check.
+ * @return true if the bus is the synthetic UIO bus, otherwise false.
+ */
+static bool metal_linux_is_uio_bus(const struct linux_bus *lbus)
+{
+	return strcmp(lbus->bus_name, "uio") == 0;
+}
+
+/**
+ * @internal
+ *
  * @brief Read the first text line from a sysfs file.
  *
  * The trailing newline is stripped so callers can compare sysfs text values as
@@ -553,8 +569,7 @@ static int metal_uio_populate(struct linux_bus *lbus, struct linux_device *ldev)
 	irq_info = 1;
 	if (write(ldev->fd, &irq_info, sizeof(irq_info)) <= 0) {
 		metal_log(METAL_LOG_INFO,
-			  "%s: No IRQ for device %s.\n",
-			  __func__, ldev->dev_name);
+			  "No IRQ for device %s.\n", ldev->dev_name);
 		ldev->device.irq_num =  0;
 		ldev->device.irq_info = (void *)-1;
 	} else {
@@ -850,6 +865,22 @@ static void metal_uio_dev_dma_unmap(struct linux_bus *lbus,
 
 static struct linux_bus linux_bus[] = {
 	{
+		.bus_name	= "uio",
+		.drivers = {
+			{
+				.drv_name  = "uio",
+				.mod_name  = "uio",
+				.cls_name  = "uio",
+				.dev_open  = metal_uio_class_dev_open,
+				.dev_close = metal_uio_dev_close,
+				.dev_irq_ack  = metal_uio_dev_irq_ack,
+				.dev_dma_map = metal_uio_dev_dma_map,
+				.dev_dma_unmap = metal_uio_dev_dma_unmap,
+			},
+			{ 0 /* sentinel */ }
+		}
+	},
+	{
 		.bus_name	= "platform",
 		.drivers = {
 			{
@@ -924,12 +955,18 @@ static int metal_linux_dev_open(struct metal_bus *bus,
 	for_each_linux_driver(lbus, ldrv) {
 
 		/* Check if we have a viable driver. */
-		if (!ldrv->sdrv || !ldrv->dev_open)
+		if (!ldrv->dev_open ||
+		    (!metal_linux_is_uio_bus(lbus) && !ldrv->sdrv))
 			continue;
 
 		/* Reset device data. */
 		memset(ldev, 0, sizeof(*ldev));
-		strncpy(ldev->dev_name, dev_name, sizeof(ldev->dev_name) - 1);
+		error = snprintf(ldev->dev_name, sizeof(ldev->dev_name),
+				 "%s", dev_name);
+		if (error < 0 || error >= (int)sizeof(ldev->dev_name)) {
+			error = -EOVERFLOW;
+			goto out;
+		}
 		ldev->fd = -1;
 		ldev->ldrv = ldrv;
 		ldev->device.bus = bus;
@@ -974,6 +1011,16 @@ static void metal_linux_dev_close(struct metal_bus *bus,
 	free(ldev);
 }
 
+/**
+ * @internal
+ *
+ * @brief Close a Linux bus and any probed sysfs driver handles.
+ *
+ * The synthetic UIO bus has no sysfs bus handle, so the bus handle is closed
+ * only when one was opened during probing.
+ *
+ * @param[in] bus Metal bus to close.
+ */
 static void metal_linux_bus_close(struct metal_bus *bus)
 {
 	struct linux_bus *lbus = to_linux_bus(bus);
@@ -985,7 +1032,8 @@ static void metal_linux_bus_close(struct metal_bus *bus)
 		ldrv->sdrv = NULL;
 	}
 
-	sysfs_close_bus(lbus->sbus);
+	if (lbus->sbus)
+		sysfs_close_bus(lbus->sbus);
 	lbus->sbus = NULL;
 }
 
@@ -1084,10 +1132,27 @@ static int metal_linux_probe_driver(struct linux_bus *lbus,
 	return ldrv->sdrv ? 0 : -ENODEV;
 }
 
+/**
+ * @internal
+ *
+ * @brief Probe and register a Linux bus.
+ *
+ * The synthetic UIO bus is registered only when the /sys/class/uio class
+ * exists and does not use normal sysfs bus or driver probing.
+ *
+ * @param[in,out] lbus Linux bus to probe.
+ * @return 0 on success, or a negative error code on failure.
+ */
 static int metal_linux_probe_bus(struct linux_bus *lbus)
 {
 	struct linux_driver *ldrv;
 	int ret, error = -ENODEV;
+
+	if (metal_linux_is_uio_bus(lbus)) {
+		if (sysfs_path_is_dir(METAL_UIO_CLASS_PATH) != 0)
+			return -ENODEV;
+		return metal_linux_register_bus(lbus);
+	}
 
 	lbus->sbus = sysfs_open_bus(lbus->bus_name);
 	if (!lbus->sbus)
