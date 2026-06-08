@@ -59,7 +59,13 @@ struct linux_device {
 	struct metal_device		device;
 	char				dev_name[PATH_MAX];
 	char				dev_path[PATH_MAX];
+	/*
+	 * UIO sysfs class directory, such as /sys/class/uio/uio0. UIO map
+	 * attributes are read relative to this path.
+	 */
 	char				cls_path[PATH_MAX];
+	char				uio_name[PATH_MAX];
+	char				uio_dev_name[PATH_MAX];
 	metal_phys_addr_t		region_phys[METAL_MAX_DEVICE_REGIONS];
 	void				*region_map_raw[METAL_MAX_DEVICE_REGIONS];
 	size_t				region_map_len[METAL_MAX_DEVICE_REGIONS];
@@ -122,6 +128,40 @@ static int metal_uio_read_map_attr(struct linux_device *ldev,
 
 	sysfs_close_attribute(attr);
 	return 0;
+}
+
+/**
+ * @internal
+ *
+ * @brief Read a string-valued UIO sysfs attribute.
+ *
+ * The value is explicitly terminated so callers can compare it as a C string.
+ *
+ * @param[in] path Path to the UIO sysfs attribute.
+ * @param[out] value Buffer that receives the attribute value.
+ * @param[in] len Size of value in bytes.
+ * @return 0 on success, or a negative error code on failure.
+ */
+static int metal_uio_read_str_attr(const char *path, char *value, size_t len)
+{
+	struct sysfs_attribute *attr;
+	int result = 0;
+
+	if (!value || !len)
+		return -EINVAL;
+
+	attr = sysfs_open_attribute(path);
+	if (!attr || sysfs_read_attribute(attr) != 0) {
+		result = -errno;
+		goto close_attr;
+	}
+
+	strncpy(value, attr->value, len - 1);
+	value[len - 1] = '\0';
+
+close_attr:
+	sysfs_close_attribute(attr);
+	return result;
 }
 
 /**
@@ -263,81 +303,30 @@ static int metal_uio_dev_bind(struct linux_device *ldev,
 	return 0;
 }
 
-static int metal_uio_dev_open(struct linux_bus *lbus, struct linux_device *ldev)
+/**
+ * @internal
+ *
+ * @brief Populate common UIO device state from resolved UIO paths.
+ *
+ * Both parent-bus opens and class-name opens share the same mmap, IRQ
+ * registration, DMA, and close-time cleanup rules.
+ *
+ * @param[in] lbus Linux bus used for diagnostics.
+ * @param[in,out] ldev Linux device with cls_path and dev_path already set.
+ * @return 0 on success, or a negative error code on failure.
+ */
+static int metal_uio_populate(struct linux_bus *lbus, struct linux_device *ldev)
 {
-	char *instance, path[SYSFS_PATH_MAX];
-	struct linux_driver *ldrv = ldev->ldrv;
 	unsigned long offset = 0, size = 0;
 	metal_phys_addr_t addr = 0, *phys;
 	struct metal_io_region *io;
 	struct metal_uio_map_info map_info;
 	size_t map_len, region_size;
-	struct dlist *dlist;
-	int result, i;
+	int result, i = 0;
 	unsigned int j;
 	void *raw, *virt;
 	int irq_info;
 
-
-	ldev->fd = -1;
-	ldev->device.irq_info = (void *)-1;
-
-	ldev->sdev = sysfs_open_device(lbus->bus_name, ldev->dev_name);
-	if (!ldev->sdev) {
-		metal_log(METAL_LOG_ERROR, "device %s:%s not found\n",
-			  lbus->bus_name, ldev->dev_name);
-		return -ENODEV;
-	}
-	metal_log(METAL_LOG_DEBUG, "opened sysfs device %s:%s\n",
-		  lbus->bus_name, ldev->dev_name);
-
-	result = metal_uio_dev_bind(ldev, ldrv);
-	if (result)
-		goto fail;
-
-	result = snprintf(path, sizeof(path), "%s/uio", ldev->sdev->path);
-	if (result < 0 || result >= (int)sizeof(path)) {
-		result = -EOVERFLOW;
-		goto fail;
-	}
-	dlist = sysfs_open_directory_list(path);
-	if (!dlist) {
-		metal_log(METAL_LOG_ERROR, "failed to scan class path %s\n",
-			  path);
-		result = -errno;
-		goto fail;
-	}
-
-	dlist_for_each_data(dlist, instance, char) {
-		result = snprintf(ldev->cls_path, sizeof(ldev->cls_path),
-				  "%s/%s", path, instance);
-		if (result < 0 || result >= (int)sizeof(ldev->cls_path)) {
-			result = -EOVERFLOW;
-			goto close_list;
-		}
-		result = snprintf(ldev->dev_path, sizeof(ldev->dev_path),
-				  "/dev/%s", instance);
-		if (result < 0 || result >= (int)sizeof(ldev->dev_path)) {
-			result = -EOVERFLOW;
-			goto close_list;
-		}
-		break;
-	}
-	result = 0;
-
-close_list:
-	sysfs_close_list(dlist);
-	if (result)
-		goto fail;
-
-	if (sysfs_path_is_dir(ldev->cls_path) != 0) {
-		metal_log(METAL_LOG_ERROR, "invalid device class path %s\n",
-			  ldev->cls_path);
-		result = -ENODEV;
-		goto fail;
-	}
-
-	i = 0;
 	do {
 		if (!access(ldev->dev_path, F_OK))
 			break;
@@ -347,14 +336,13 @@ close_list:
 	if (i >= 1000) {
 		metal_log(METAL_LOG_ERROR, "failed to open file %s, timeout.\n",
 			  ldev->dev_path);
-		result = -ENODEV;
-		goto fail;
+		return -ENODEV;
 	}
 	result = metal_open(ldev->dev_path, 0);
 	if (result < 0) {
-		metal_log(METAL_LOG_ERROR, "failed to open device %s\n",
+		metal_log(METAL_LOG_ERROR, "failed to open device %s: %s\n",
 			  ldev->dev_path, strerror(-result));
-		goto fail;
+		return result;
 	}
 	ldev->fd = result;
 
@@ -440,19 +428,136 @@ fail:
 	ldev->device.num_regions = 0;
 	ldev->device.irq_num = 0;
 	ldev->device.irq_info = (void *)-1;
-	if (ldev->override) {
-		sysfs_write_attribute(ldev->override, "", 1);
-		ldev->override = NULL;
-	}
-	if (ldev->sdev) {
-		sysfs_close_device(ldev->sdev);
-		ldev->sdev = NULL;
-	}
 	if (ldev->fd >= 0) {
 		close(ldev->fd);
 		ldev->fd = -1;
 	}
 
+	return result;
+}
+
+static void metal_uio_dev_close(struct linux_bus *lbus,
+				struct linux_device *ldev);
+
+/**
+ * @internal
+ *
+ * @brief Open a parent-bus device that exposes a UIO child.
+ *
+ * This path binds the parent device to a UIO driver before using the common
+ * UIO populate logic.
+ *
+ * @param[in] lbus Linux bus containing the parent device.
+ * @param[in,out] ldev Linux device to open.
+ * @return 0 on success, or a negative error code on failure.
+ */
+static int metal_uio_dev_open(struct linux_bus *lbus, struct linux_device *ldev)
+{
+	char *instance, path[SYSFS_PATH_MAX];
+	struct linux_driver *ldrv = ldev->ldrv;
+	struct dlist *dlist;
+	int result;
+
+	ldev->fd = -1;
+	ldev->device.irq_info = (void *)-1;
+
+	ldev->sdev = sysfs_open_device(lbus->bus_name, ldev->dev_name);
+	if (!ldev->sdev) {
+		metal_log(METAL_LOG_ERROR, "device %s:%s not found\n",
+			  lbus->bus_name, ldev->dev_name);
+		return -ENODEV;
+	}
+	metal_log(METAL_LOG_DEBUG, "opened sysfs device %s:%s\n",
+		  lbus->bus_name, ldev->dev_name);
+	/*
+	 * Error paths after this point clean up locally. The common open loop
+	 * may call dev_close() again, so close must tolerate partial cleanup.
+	 */
+
+	/*
+	 * Parent-bus opens still need the requested platform or PCI device
+	 * bound to the selected UIO driver before a /dev/uioX node can exist.
+	 */
+	result = metal_uio_dev_bind(ldev, ldrv);
+	if (result)
+		goto fail;
+
+	/*
+	 * A bound parent device exposes one UIO child below its sysfs device
+	 * directory. Use that child name to derive both sysfs and /dev paths.
+	 */
+	result = snprintf(path, sizeof(path), "%s/uio", ldev->sdev->path);
+	if (result < 0 || result >= (int)sizeof(path)) {
+		result = -EOVERFLOW;
+		goto fail;
+	}
+	dlist = sysfs_open_directory_list(path);
+	if (!dlist) {
+		metal_log(METAL_LOG_ERROR, "failed to scan class path %s\n",
+			  path);
+		result = -errno;
+		goto fail;
+	}
+
+	dlist_for_each_data(dlist, instance, char) {
+		/*
+		 * The first UIO child is the device node this parent-bus open
+		 * will use for mmap, IRQ, and DMA operations.
+		 */
+		result = snprintf(ldev->cls_path, sizeof(ldev->cls_path),
+				  "%s/%s", path, instance);
+		if (result < 0 || result >= (int)sizeof(ldev->cls_path)) {
+			result = -EOVERFLOW;
+			goto close_list;
+		}
+		result = snprintf(ldev->dev_path, sizeof(ldev->dev_path),
+				  "/dev/%s", instance);
+		if (result < 0 || result >= (int)sizeof(ldev->dev_path)) {
+			result = -EOVERFLOW;
+			goto close_list;
+		}
+		result = snprintf(path, sizeof(path), "%s/name", ldev->cls_path);
+		if (result < 0 || result >= (int)sizeof(path)) {
+			result = -EOVERFLOW;
+			goto close_list;
+		}
+		ldev->uio_name[0] = '\0';
+		metal_uio_read_str_attr(path, ldev->uio_name,
+					sizeof(ldev->uio_name));
+		result = snprintf(ldev->uio_dev_name,
+				  sizeof(ldev->uio_dev_name), "%s", instance);
+		if (result < 0 || result >= (int)sizeof(ldev->uio_dev_name)) {
+			result = -EOVERFLOW;
+			goto close_list;
+		}
+		break;
+	}
+
+	sysfs_close_list(dlist);
+	result = 0;
+
+	/* Refuse to continue if the selected UIO class path disappeared. */
+	if (sysfs_path_is_dir(ldev->cls_path) != 0) {
+		metal_log(METAL_LOG_ERROR, "invalid device class path %s\n",
+			  ldev->cls_path);
+		result = -ENODEV;
+		goto fail;
+	}
+
+	/*
+	 * Once cls_path and dev_path are resolved, the rest of the open flow is
+	 * shared with the synthetic UIO class-name path.
+	 */
+	result = metal_uio_populate(lbus, ldev);
+	if (result)
+		goto fail;
+
+	return 0;
+
+close_list:
+	sysfs_close_list(dlist);
+fail:
+	metal_uio_dev_close(lbus, ldev);
 	return result;
 }
 
