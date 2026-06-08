@@ -15,10 +15,13 @@
 #include <metal/irq.h>
 
 #include <stdint.h>
+#include <stdbool.h>
+#include <dirent.h>
 
 #include "irq.h"
 
 #define MAX_DRIVERS	64
+#define METAL_UIO_CLASS_PATH "/sys/class/uio"
 
 struct linux_bus;
 struct linux_device;
@@ -103,6 +106,48 @@ static struct linux_bus *to_linux_bus(struct metal_bus *bus)
 static struct linux_device *to_linux_device(struct metal_device *device)
 {
 	return metal_container_of(device, struct linux_device, device);
+}
+
+/**
+ * @internal
+ *
+ * @brief Read the first text line from a sysfs file.
+ *
+ * The trailing newline is stripped so callers can compare sysfs text values as
+ * C strings.
+ *
+ * @param[in] path Path to the sysfs file.
+ * @param[out] output Buffer that receives the first line.
+ * @param[in] output_len Size of output in bytes.
+ * @return 0 on success, or a negative error code on failure.
+ */
+static int metal_linux_read_first_line(const char *path, char *output,
+				       size_t output_len)
+{
+	FILE *fp;
+	char *newline;
+	int result = 0;
+
+	if (!path || !output || output_len < 2)
+		return -EINVAL;
+
+	fp = fopen(path, "r");
+	if (!fp)
+		return -errno;
+
+	if (!fgets(output, output_len, fp)) {
+		result = ferror(fp) ? -errno : -ENODATA;
+		goto close_file;
+	}
+
+	newline = strchr(output, '\n');
+	if (newline)
+		*newline = '\0';
+
+close_file:
+	fclose(fp);
+
+	return result;
 }
 
 static int metal_uio_read_map_attr(struct linux_device *ldev,
@@ -250,6 +295,108 @@ static int metal_linux_uio_map_info(struct metal_uio_map_info *info)
 	*info->region_size = (size_t)(info->map_size - info->offset);
 
 	return 0;
+}
+
+/**
+ * @internal
+ *
+ * @brief Find a UIO class device by its exported name.
+ *
+ * This scans /sys/class/uio/uioX/name for the requested libmetal device name.
+ * The UIO class name must uniquely identify the device because there is no
+ * parent platform or PCI sysfs device to bind through first.
+ *
+ * @param[in] uio_name UIO name to search for.
+ * @param[out] ldev Linux device to populate with the resolved paths.
+ * @return 0 on success, or a negative error code on failure.
+ */
+static int metal_uio_find_device_by_name(const char *uio_name,
+					 struct linux_device *ldev)
+{
+	DIR *dir;
+	struct dirent *entry;
+	char path[PATH_MAX];
+	char value[PATH_MAX];
+	bool found = false;
+	int result = -ENODEV;
+
+	if (!uio_name || !strlen(uio_name) || !ldev)
+		return -EINVAL;
+
+	dir = opendir(METAL_UIO_CLASS_PATH);
+	if (!dir) {
+		result = errno == ENOENT ? -ENODEV : -errno;
+		return result;
+	}
+
+	/*
+	 * Walk every UIO class device and compare its reported name against the
+	 * requested libmetal name. Continue after a match so duplicate names can
+	 * be detected instead of silently choosing a nondeterministic device.
+	 */
+	while ((entry = readdir(dir)) != NULL) {
+		if (strncmp(entry->d_name, "uio", 3) != 0)
+			continue;
+
+		result = snprintf(path, sizeof(path), "%s/%s/name",
+				  METAL_UIO_CLASS_PATH, entry->d_name);
+		if (result < 0 || result >= (int)sizeof(path)) {
+			result = -EOVERFLOW;
+			goto out;
+		}
+
+		result = metal_linux_read_first_line(path, value,
+						     sizeof(value));
+		if (result)
+			continue;
+
+		if (strcmp(value, uio_name) != 0)
+			continue;
+
+		if (found) {
+			/* Duplicate names cannot be opened deterministically. */
+			result = -EEXIST;
+			goto out;
+		}
+		found = true;
+
+		result = snprintf(ldev->cls_path, sizeof(ldev->cls_path),
+				  "%s/%s", METAL_UIO_CLASS_PATH,
+				  entry->d_name);
+		if (result < 0 || result >= (int)sizeof(ldev->cls_path)) {
+			result = -EOVERFLOW;
+			goto out;
+		}
+		/*
+		 * Fill the same fields as the parent-bus UIO path so both
+		 * open modes can share metal_uio_populate().
+		 */
+		result = snprintf(ldev->dev_path, sizeof(ldev->dev_path),
+				  "/dev/%s", entry->d_name);
+		if (result < 0 || result >= (int)sizeof(ldev->dev_path)) {
+			result = -EOVERFLOW;
+			goto out;
+		}
+		result = snprintf(ldev->uio_name, sizeof(ldev->uio_name),
+				  "%s", value);
+		if (result < 0 || result >= (int)sizeof(ldev->uio_name)) {
+			result = -EOVERFLOW;
+			goto out;
+		}
+		result = snprintf(ldev->uio_dev_name,
+				  sizeof(ldev->uio_dev_name), "%s",
+				  entry->d_name);
+		if (result < 0 || result >= (int)sizeof(ldev->uio_dev_name)) {
+			result = -EOVERFLOW;
+			goto out;
+		}
+	}
+
+	result = found ? 0 : -ENODEV;
+
+out:
+	closedir(dir);
+	return result;
 }
 
 static int metal_uio_dev_bind(struct linux_device *ldev,
@@ -559,6 +706,36 @@ close_list:
 fail:
 	metal_uio_dev_close(lbus, ldev);
 	return result;
+}
+
+/**
+ * @internal
+ *
+ * @brief Open a UIO class device through the synthetic UIO bus.
+ *
+ * The device name is matched against /sys/class/uio/uioX/name. No parent
+ * sysfs device is available on this path.
+ *
+ * @param[in] lbus Synthetic UIO bus.
+ * @param[in,out] ldev Linux device to open.
+ * @return 0 on success, or a negative error code on failure.
+ */
+static int metal_uio_class_dev_open(struct linux_bus *lbus,
+				    struct linux_device *ldev)
+{
+	int result;
+
+	ldev->fd = -1;
+	ldev->device.irq_info = (void *)-1;
+
+	result = metal_uio_find_device_by_name(ldev->dev_name, ldev);
+	if (result) {
+		metal_log(METAL_LOG_ERROR, "UIO device %s not found\n",
+			  ldev->dev_name);
+		return result;
+	}
+
+	return metal_uio_populate(lbus, ldev);
 }
 
 static void metal_uio_dev_close(struct linux_bus *lbus,
